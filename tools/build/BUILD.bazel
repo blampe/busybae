@@ -1,0 +1,7 @@
+# The workspace-status script isn't a Bazel target; it's invoked by Bazel
+# itself via --workspace_status_command. exports_files makes it visible so
+# .bazelrc's relative path resolves in bzlmod builds.
+exports_files(
+    ["status.sh"],
+    visibility = ["//visibility:public"],
+)

@@ -1,0 +1,28 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "bazelrc",
+    srcs = [
+        "discover.go",
+        "parser.go",
+        "paths.go",
+        "resolve.go",
+    ],
+    importpath = "busybae/internal/bazelrc",
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "bazelrc_test",
+    srcs = [
+        "discover_test.go",
+        "parser_test.go",
+        "paths_test.go",
+        "resolve_test.go",
+    ],
+    embed = [":bazelrc"],
+    deps = [
+        "@com_github_google_go_cmp//cmp",
+        "@com_github_google_go_cmp//cmp/cmpopts",
+    ],
+)

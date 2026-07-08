@@ -1,0 +1,25 @@
+common --enable_bzlmod
+common --incompatible_disallow_empty_glob
+
+# --stamp bakes workspace-status keys (STABLE_BUSYBAE_VERSION, etc.) into
+# link-time x_defs. Without --stamp, x_defs values that reference stamp
+# keys are left as the literal placeholder string, which is fine for
+# quick iteration and awful for producing release artifacts. We turn it
+# on by default so `bazel build //:busybae` always produces a versioned
+# binary; the volatile portion of stamping is scoped narrowly so the
+# action cache stays effective.
+build --stamp
+build --workspace_status_command=tools/build/status.sh
+
+# rules_go's default nogo is a no-op unless configured. Leave it off in
+# this project — analyzers live in the go/analysis vet tooling and we
+# invoke them via `bazelisk test //...`.
+
+test --test_output=errors
+test --test_verbose_timeout_warnings
+
+# Platform-specific hints (populate as needed).
+build:linux --platforms=@rules_go//go/toolchain:linux_amd64
+build:linux_arm64 --platforms=@rules_go//go/toolchain:linux_arm64
+build:darwin --platforms=@rules_go//go/toolchain:darwin_arm64
+build:darwin_amd64 --platforms=@rules_go//go/toolchain:darwin_amd64

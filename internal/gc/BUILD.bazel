@@ -1,0 +1,22 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "gc",
+    srcs = [
+        "gc.go",
+        "nlink_other.go",
+        "nlink_unix.go",
+        "output.go",
+    ],
+    importpath = "busybae/internal/gc",
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "gc_test",
+    srcs = [
+        "gc_test.go",
+        "output_test.go",
+    ],
+    embed = [":gc"],
+)

@@ -1,0 +1,20 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "daemon",
+    srcs = [
+        "daemon.go",
+        "spawn.go",
+    ],
+    importpath = "busybae/internal/daemon",
+    visibility = ["//:__subpackages__"],
+)
+
+go_test(
+    name = "daemon_test",
+    srcs = [
+        "daemon_test.go",
+        "stale_test.go",
+    ],
+    embed = [":daemon"],
+)
