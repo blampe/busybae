@@ -1,27 +1,23 @@
-// Package gc implements a time-based sweep of a Bazel cache directory.
+// Package gc implements cache-specific sweeps for the four cache directories
+// that Bazel does not clean up on its own or for which the user wants a more
+// aggressive policy than Bazel's built-in GC:
 //
-// The sweep is designed to be safe when Bazel is running against the same
-// cache:
+//   - repository/download cache (`content_addressable/<hashName>/<key>/`)
+//   - repository/contents cache (`contents/<predeclaredInputHash>/<UUID>/`)
+//   - disk cache (`ac/`, `cas/`)
+//   - output_user_root (whole output_base subtrees for gone workspaces)
 //
-//   - We only touch entries whose mtime is older than MaxAge. Bazel updates
-//     mtime on write (and Bazel builds with a live cache touch its recently
-//     used files on read, if cache_test_results / --experimental_repository_cache_hardlinks
-//     is off — mtime for our purposes is a conservative proxy for "not used
-//     recently").
-//   - We move eligible files into a trash subdirectory rooted inside the
-//     cache dir itself. Both source and destination are on the same
-//     filesystem, so the rename is atomic. Any Bazel process holding an
-//     open fd against the old path continues to read successfully; any
-//     future open sees ENOENT and Bazel's own logic will refetch/recompute.
-//   - Only after the walk completes do we blow away the trash directory. If
-//     the process dies mid-sweep, the next start collects the leftover
-//     trash.
+// Each cache has a different atomicity boundary, and mixing them up is how
+// you delete a MODULE.bazel out from under a live build. The sweep functions
+// here mirror Bazel's own GC algorithms (see LocalRepoContentsCache,
+// DiskCacheGarbageCollector, DownloadCache in the Bazel tree) so a concurrent
+// Bazel process and a busybae sweep never disagree about what's safe to
+// remove.
+//
+// Shared concerns live here; per-cache logic lives in one file each.
 package gc
 
 import (
-	"context"
-	"errors"
-	"fmt"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -30,9 +26,15 @@ import (
 	"time"
 )
 
+// trashPrefix names busybae's own per-sweep trash directories. The prefix
+// is chosen so a) it can never collide with a Bazel-managed cache entry
+// (all of Bazel's entries are hex or reserved names like `install`), and
+// b) a leftover trash tree from a crashed sweep is easy to collect on the
+// next run.
 const trashPrefix = ".busybae-trash-"
 
-// Options configures a sweep.
+// Options configures a sweep. Not every field is honored by every sweep
+// (see per-function comments).
 type Options struct {
 	// MaxAge is the mtime cutoff. Files older than now-MaxAge are
 	// eligible for removal. Zero means "never eligible" (no-op sweep).
@@ -40,18 +42,8 @@ type Options struct {
 	// DryRun logs what would be removed without renaming/deleting.
 	DryRun bool
 	// IncludeHardlinked, when true, evicts cache entries even when they
-	// have additional hardlinks pointing at them.
-	//
-	// Bazel's repository cache uses hardlinks (default behavior in
-	// modern Bazel; see --experimental_repository_cache_hardlinks): a
-	// cache entry with nlink > 1 is being held by a live workspace's
-	// external tree, and removing our copy does not reclaim disk space
-	// — it just makes the next fetch re-materialize the link. The safe
-	// default (false) is therefore to skip hardlinked entries.
-	//
-	// Set this to true when you know the linked workspaces are stale
-	// (e.g. output_bases you no longer use) and you want to force
-	// eviction anyway.
+	// have additional hardlinks pointing at them. Only meaningful for
+	// the download cache (see SweepDownloadCache).
 	IncludeHardlinked bool
 	// Logger receives structured events. Nil means slog.Default().
 	Logger *slog.Logger
@@ -67,17 +59,15 @@ type Stats struct {
 	Errors             int
 	SkippedHardlinks   int
 	OrphanedWorkspaces int // output_base sweeps: number of removals attributed to a missing workspace path
+	// ConcurrentUpdate reports whether the sweep noticed an entry
+	// changing under it between scan and delete. It's informational —
+	// the sweep still succeeds — but a persistently high rate suggests
+	// the interval is too aggressive.
+	ConcurrentUpdate bool
 }
 
-// Sweep walks root and removes files with mtime older than the cutoff. It
-// is safe to call against a live Bazel cache directory.
-//
-// If root does not exist, Sweep returns nil with zero stats.
-func Sweep(ctx context.Context, root string, opts Options) (Stats, error) {
-	var stats Stats
-	if opts.MaxAge <= 0 {
-		return stats, nil
-	}
+// resolveOptions fills in the standard defaults for logger and clock hooks.
+func resolveOptions(opts Options) (*slog.Logger, func() time.Time) {
 	log := opts.Logger
 	if log == nil {
 		log = slog.Default()
@@ -86,121 +76,27 @@ func Sweep(ctx context.Context, root string, opts Options) (Stats, error) {
 	if now == nil {
 		now = time.Now
 	}
-
-	info, err := os.Stat(root)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return stats, nil
-		}
-		return stats, err
-	}
-	if !info.IsDir() {
-		return stats, fmt.Errorf("sweep target %q is not a directory", root)
-	}
-
-	// First, clean up any leftover trash from previous runs. We do this
-	// unconditionally so a crashed prior sweep doesn't leak space.
-	cleanupOldTrash(root, log)
-
-	// Create a fresh trash dir inside root. Same filesystem → atomic
-	// renames.
-	var trash string
-	if !opts.DryRun {
-		t, terr := os.MkdirTemp(root, trashPrefix)
-		if terr != nil {
-			return stats, fmt.Errorf("create trash dir: %w", terr)
-		}
-		trash = t
-		defer func() {
-			if rmErr := os.RemoveAll(trash); rmErr != nil {
-				log.Warn("removing trash failed", slog.String("path", trash), slog.Any("err", rmErr))
-			}
-		}()
-	}
-
-	cutoff := now().Add(-opts.MaxAge)
-
-	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if cerr := ctx.Err(); cerr != nil {
-			return cerr
-		}
-		if err != nil {
-			// A transient stat error (Bazel writing? disk hiccup?)
-			// shouldn't kill the whole sweep. Skip and record.
-			stats.Errors++
-			log.Debug("walk error", slog.String("path", path), slog.Any("err", err))
-			return nil
-		}
-		// Skip our own trash tree.
-		if d.IsDir() && strings.HasPrefix(d.Name(), trashPrefix) {
-			return fs.SkipDir
-		}
-		if !d.Type().IsRegular() {
-			return nil
-		}
-		stats.Scanned++
-		info, ierr := d.Info()
-		if ierr != nil {
-			stats.Errors++
-			return nil
-		}
-		if info.ModTime().After(cutoff) {
-			return nil
-		}
-		if !opts.IncludeHardlinked && hasExtraHardlinks(info) {
-			stats.SkippedHardlinks++
-			return nil
-		}
-		if opts.DryRun {
-			stats.Removed++
-			stats.Bytes += info.Size()
-			log.Info("would remove",
-				slog.String("path", path),
-				slog.Time("mtime", info.ModTime()),
-				slog.Int64("bytes", info.Size()))
-			return nil
-		}
-		rel, relErr := filepath.Rel(root, path)
-		if relErr != nil {
-			stats.Errors++
-			return nil
-		}
-		dst := filepath.Join(trash, rel)
-		if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
-			stats.Errors++
-			log.Debug("mkdir trash subpath failed", slog.String("path", path), slog.Any("err", err))
-			return nil
-		}
-		if err := os.Rename(path, dst); err != nil {
-			// If Bazel raced us and the file vanished, that's fine.
-			if errors.Is(err, fs.ErrNotExist) {
-				return nil
-			}
-			stats.Errors++
-			log.Debug("rename to trash failed", slog.String("path", path), slog.Any("err", err))
-			return nil
-		}
-		stats.Removed++
-		stats.Bytes += info.Size()
-		return nil
-	})
-	if walkErr != nil && !errors.Is(walkErr, context.Canceled) {
-		return stats, walkErr
-	}
-	log.Info("sweep complete",
-		slog.String("root", root),
-		slog.Int("scanned", stats.Scanned),
-		slog.Int("removed", stats.Removed),
-		slog.Int64("bytes", stats.Bytes),
-		slog.Int("errors", stats.Errors),
-		slog.Int("skipped_hardlinks", stats.SkippedHardlinks),
-		slog.Bool("dry_run", opts.DryRun))
-	return stats, walkErr
+	return log, now
 }
 
-// cleanupOldTrash removes any residual trash directories from prior runs.
-// Failures here are logged and swallowed; they don't affect the current
-// sweep's correctness.
+// prepareRoot stats root, treating a missing directory as a no-op. Returns
+// ok=false when the caller should return early with zero stats.
+func prepareRoot(root string) (ok bool, err error) {
+	info, err := os.Stat(root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if !info.IsDir() {
+		return false, &fs.PathError{Op: "stat", Path: root, Err: fs.ErrInvalid}
+	}
+	return true, nil
+}
+
+// cleanupOldTrash removes any residual busybae trash directories from prior
+// runs. Failures are logged and swallowed; they don't affect correctness.
 func cleanupOldTrash(root string, log *slog.Logger) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -215,4 +111,18 @@ func cleanupOldTrash(root string, log *slog.Logger) {
 			log.Warn("cleanup old trash failed", slog.String("path", p), slog.Any("err", err))
 		}
 	}
+}
+
+// makeTrash creates a fresh trash directory inside root. Callers must call
+// the cleanup func exactly once (typically via defer).
+func makeTrash(root string, log *slog.Logger) (trash string, cleanup func(), err error) {
+	t, err := os.MkdirTemp(root, trashPrefix)
+	if err != nil {
+		return "", nil, err
+	}
+	return t, func() {
+		if rmErr := os.RemoveAll(t); rmErr != nil {
+			log.Warn("removing trash failed", slog.String("path", t), slog.Any("err", rmErr))
+		}
+	}, nil
 }

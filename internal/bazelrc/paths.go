@@ -14,12 +14,29 @@ import (
 //
 // When a flag appears multiple times, the last occurrence wins — matching
 // Bazel's own semantics.
+//
+// Two of the "cache paths" a user configures actually resolve to *two*
+// on-disk trees each. `--repository_cache=X` puts a download cache at
+// `X/content_addressable/` and a repo-contents cache at `X/contents/`
+// (see Bazel's RepositoryCache.java). `--repo_contents_cache=Y` overrides
+// just the second one. We expose the derived, actionable paths as
+// `DownloadCache` and `RepoContentsCache` so callers don't have to
+// re-derive the layout at every sweep site.
 type CacheDirs struct {
-	// RepositoryCache is --repository_cache.
+	// RepositoryCache is the raw --repository_cache value. Retained for
+	// diagnostic output; sweep code should prefer DownloadCache /
+	// RepoContentsCache.
 	RepositoryCache string
+	// DownloadCache is the actionable path of the download-cache subtree.
+	// It's <RepositoryCache>/content_addressable when RepositoryCache
+	// is set, and empty otherwise.
+	DownloadCache string
 	// DiskCache is --disk_cache.
 	DiskCache string
-	// RepoContentsCache is --repo_contents_cache (Bazel 7+).
+	// RepoContentsCache is the actionable path of the repo-contents-cache
+	// subtree. If --repo_contents_cache is set explicitly, it wins.
+	// Otherwise, when --repository_cache is set, this falls back to
+	// <RepositoryCache>/contents.
 	RepoContentsCache string
 	// OutputUserRoot is startup --output_user_root.
 	OutputUserRoot string
@@ -105,6 +122,15 @@ func ExtractCacheDirs(entries []Entry, workspace, home string, activeConfigs []s
 	if err := resolve(&c.OutputUserRoot, ourSrc); err != nil {
 		return c, err
 	}
+	// Derive the two subtrees underneath --repository_cache. Bazel's
+	// RepositoryCache.java hardcodes these subdirectory names ("content_
+	// addressable" and "contents"), so we match them here.
+	if c.RepositoryCache != "" {
+		c.DownloadCache = filepath.Join(c.RepositoryCache, "content_addressable")
+		if c.RepoContentsCache == "" {
+			c.RepoContentsCache = filepath.Join(c.RepositoryCache, "contents")
+		}
+	}
 	return c, nil
 }
 
@@ -127,11 +153,14 @@ func ParseBazelDuration(s string) (time.Duration, error) {
 	return time.ParseDuration(s)
 }
 
-// SweepableDirs returns the cache directories that busybae should GC. It
-// excludes OutputUserRoot (managed by Bazel) and drops empty entries.
+// SweepableDirs returns the actionable cache directories that busybae
+// should GC. It excludes OutputUserRoot (managed by Bazel and, when
+// desired, swept separately) and drops empty entries. The result contains
+// the *derived* download and repo-contents paths — never the raw
+// --repository_cache root, which contains both.
 func (c CacheDirs) SweepableDirs() []string {
 	out := make([]string, 0, 3)
-	for _, d := range []string{c.RepositoryCache, c.DiskCache, c.RepoContentsCache} {
+	for _, d := range []string{c.DownloadCache, c.DiskCache, c.RepoContentsCache} {
 		if d != "" {
 			out = append(out, d)
 		}

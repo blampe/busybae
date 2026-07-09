@@ -54,7 +54,7 @@ type globalFlags struct {
 	idleTimeout       time.Duration
 	gcInterval        time.Duration
 	maxAge            time.Duration
-	maxAgeRepoCache   time.Duration
+	maxAgeDownload    time.Duration
 	maxAgeDiskCache   time.Duration
 	maxAgeRepoContent time.Duration
 	maxAgeOutputBase  time.Duration
@@ -71,7 +71,7 @@ func (g *globalFlags) register(fs *flag.FlagSet) {
 	fs.DurationVar(&g.idleTimeout, "idle-timeout", defaultIdleTimeout, "Daemon exits after this long without a poke")
 	fs.DurationVar(&g.gcInterval, "gc-interval", defaultGCInterval, "How often the daemon sweeps")
 	fs.DurationVar(&g.maxAge, "max-age", defaultMaxAge, "Default cache-entry age cutoff (per-type flags override)")
-	fs.DurationVar(&g.maxAgeRepoCache, "max-age-repository-cache", zeroDuration, "Override --max-age for --repository_cache (0 = inherit)")
+	fs.DurationVar(&g.maxAgeDownload, "max-age-repository-cache", zeroDuration, "Override --max-age for the --repository_cache download subtree (0 = inherit)")
 	fs.DurationVar(&g.maxAgeDiskCache, "max-age-disk-cache", zeroDuration, "Override --max-age for --disk_cache (0 = inherit)")
 	fs.DurationVar(&g.maxAgeRepoContent, "max-age-repo-contents-cache", zeroDuration, "Override --max-age for --repo_contents_cache (0 = inherit)")
 	fs.DurationVar(&g.maxAgeOutputBase, "max-age-output-base", defaultMaxAgeOutputBase, "Age cutoff for orphaned output_base subtrees (only used with --sweep-output-base)")
@@ -255,10 +255,19 @@ func resolveWorkspace(explicit string) (string, error) {
 // sweepTarget describes one directory to sweep along with the type-specific
 // max age that applies to it.
 type sweepTarget struct {
-	Kind   string // "repository_cache", "disk_cache", "repo_contents_cache"
+	Kind   string // one of the sweepKind* constants
 	Path   string
 	MaxAge time.Duration
 }
+
+// Kinds are distinct on-disk formats; each dispatches to its own sweep
+// function in runSweeps.
+const (
+	sweepKindDownload     = "download_cache"      // <root>/<hashName>/<key>/{file,id-*}
+	sweepKindDiskCache    = "disk_cache"          // <root>/{ac,cas,tmp,gc}
+	sweepKindRepoContents = "repo_contents_cache" // <root>/<hash>/{<UUID>,<UUID>.recorded_inputs}
+	sweepKindOutputBase   = "output_base"         // <output_user_root>/<32-hex>/
+)
 
 func discoverDirs(workspace string) (bazelrc.CacheDirs, error) {
 	home, _ := os.UserHomeDir()
@@ -307,24 +316,27 @@ func activeConfigs(entries []bazelrc.Entry) []string {
 }
 
 // sweepTargets zips the discovered cache dirs with the per-type max ages
-// the user configured, dropping any that are unset.
+// the user configured, dropping any that are unset. The download-cache
+// and repo-contents-cache subtrees are separate targets even when they
+// share a `--repository_cache` root — they have different on-disk layouts
+// and need different sweep algorithms.
 func (g globalFlags) sweepTargets(c bazelrc.CacheDirs) []sweepTarget {
 	var out []sweepTarget
-	if c.RepositoryCache != "" {
+	if c.DownloadCache != "" {
 		out = append(out, sweepTarget{
-			Kind: "repository_cache", Path: c.RepositoryCache,
-			MaxAge: g.maxAgeFor(g.maxAgeRepoCache),
+			Kind: sweepKindDownload, Path: c.DownloadCache,
+			MaxAge: g.maxAgeFor(g.maxAgeDownload),
 		})
 	}
 	if c.DiskCache != "" {
 		out = append(out, sweepTarget{
-			Kind: "disk_cache", Path: c.DiskCache,
+			Kind: sweepKindDiskCache, Path: c.DiskCache,
 			MaxAge: g.maxAgeFor(g.maxAgeDiskCache),
 		})
 	}
 	if c.RepoContentsCache != "" {
 		out = append(out, sweepTarget{
-			Kind: "repo_contents_cache", Path: c.RepoContentsCache,
+			Kind: sweepKindRepoContents, Path: c.RepoContentsCache,
 			MaxAge: g.maxAgeFor(g.maxAgeRepoContent),
 		})
 	}
@@ -437,8 +449,8 @@ func forwardFlags(g globalFlags) []string {
 	if g.includeHardlinked {
 		out = append(out, "--include-hardlinked")
 	}
-	if g.maxAgeRepoCache > 0 {
-		out = append(out, "--max-age-repository-cache", g.maxAgeRepoCache.String())
+	if g.maxAgeDownload > 0 {
+		out = append(out, "--max-age-repository-cache", g.maxAgeDownload.String())
 	}
 	if g.maxAgeDiskCache > 0 {
 		out = append(out, "--max-age-disk-cache", g.maxAgeDiskCache.String())
@@ -585,18 +597,35 @@ type sweepResult struct {
 	Stats gc.Stats
 }
 
-// runSweeps issues one gc.Sweep per configured cache dir plus an optional
-// output-base sweep. Errors are logged but don't halt subsequent sweeps —
-// a broken repository_cache should not skip disk_cache eviction.
+// runSweeps dispatches each target to the sweep function that matches its
+// cache layout. Errors from any one sweep are logged and swallowed — a
+// broken repository cache should not skip disk_cache eviction.
 func runSweeps(ctx context.Context, log *slog.Logger, g globalFlags, targets []sweepTarget, outputUserRoot string) []sweepResult {
 	results := make([]sweepResult, 0, len(targets)+1)
 	for _, t := range targets {
-		stats, err := gc.Sweep(ctx, t.Path, gc.Options{
+		opts := gc.Options{
 			MaxAge:            t.MaxAge,
 			DryRun:            g.dryRun,
 			IncludeHardlinked: g.includeHardlinked,
-			Logger:            log.With(slog.String("kind", t.Kind)),
-		})
+			Logger:            log,
+		}
+		var (
+			stats gc.Stats
+			err   error
+		)
+		switch t.Kind {
+		case sweepKindDownload:
+			stats, err = gc.SweepDownloadCache(ctx, t.Path, opts)
+		case sweepKindDiskCache:
+			stats, err = gc.SweepDiskCache(ctx, t.Path, opts)
+		case sweepKindRepoContents:
+			stats, err = gc.SweepRepoContentsCache(ctx, t.Path, opts)
+		default:
+			log.Warn("unknown sweep kind — skipping",
+				slog.String("kind", t.Kind),
+				slog.String("dir", t.Path))
+			continue
+		}
 		if err != nil {
 			log.Warn("sweep failed",
 				slog.String("kind", t.Kind),
@@ -609,14 +638,14 @@ func runSweeps(ctx context.Context, log *slog.Logger, g globalFlags, targets []s
 		stats, err := gc.SweepOutputBases(ctx, outputUserRoot, gc.Options{
 			MaxAge: g.maxAgeOutputBase,
 			DryRun: g.dryRun,
-			Logger: log.With(slog.String("kind", "output_base")),
+			Logger: log.With(slog.String("kind", sweepKindOutputBase)),
 		})
 		if err != nil {
 			log.Warn("output-base sweep failed",
 				slog.String("root", outputUserRoot),
 				slog.Any("err", err))
 		}
-		results = append(results, sweepResult{Kind: "output_base", Path: outputUserRoot, Stats: stats})
+		results = append(results, sweepResult{Kind: sweepKindOutputBase, Path: outputUserRoot, Stats: stats})
 	}
 	return results
 }
@@ -728,9 +757,10 @@ func cmdDirs(args []string) int {
 	g.applyBazelrcTTL(fs, cache.DiskCacheGCMaxAge)
 	targets := g.sweepTargets(cache)
 	fmt.Printf("workspace:          %s\n", ws)
-	fmt.Printf("repository_cache:   %s (max-age %s)\n", cache.RepositoryCache, g.maxAgeFor(g.maxAgeRepoCache))
+	fmt.Printf("repository_cache:   %s\n", cache.RepositoryCache)
+	fmt.Printf("  download subtree: %s (max-age %s)\n", cache.DownloadCache, g.maxAgeFor(g.maxAgeDownload))
+	fmt.Printf("  contents subtree: %s (max-age %s)\n", cache.RepoContentsCache, g.maxAgeFor(g.maxAgeRepoContent))
 	fmt.Printf("disk_cache:         %s (max-age %s)\n", cache.DiskCache, g.maxAgeFor(g.maxAgeDiskCache))
-	fmt.Printf("repo_contents:      %s (max-age %s)\n", cache.RepoContentsCache, g.maxAgeFor(g.maxAgeRepoContent))
 	outputNote := "(not swept — pass --sweep-output-base to enable)"
 	if g.sweepOutputBase {
 		outputNote = fmt.Sprintf("(swept, max-age %s)", g.maxAgeOutputBase)

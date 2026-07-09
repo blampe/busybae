@@ -3,7 +3,12 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 go_library(
     name = "gc",
     srcs = [
+        "contents.go",
+        "disk.go",
+        "download.go",
         "gc.go",
+        "lock_other.go",
+        "lock_unix.go",
         "nlink_other.go",
         "nlink_unix.go",
         "output.go",
@@ -15,7 +20,10 @@ go_library(
 go_test(
     name = "gc_test",
     srcs = [
-        "gc_test.go",
+        "contents_test.go",
+        "disk_test.go",
+        "download_test.go",
+        "helpers_test.go",
         "output_test.go",
     ],
     embed = [":gc"],
