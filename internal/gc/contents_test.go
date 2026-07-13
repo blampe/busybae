@@ -180,6 +180,48 @@ func TestSweepRepoContentsCache_MarkerDeletedBeforeContentsRename(t *testing.T) 
 	}
 }
 
+func TestSweepRepoContentsCache_ReportsContentsDirBytes(t *testing.T) {
+	// Regression: the sweep previously accounted for the tiny marker
+	// file's size instead of the paired contents dir, understating
+	// reclaimed bytes by orders of magnitude.
+	root := t.TempDir()
+	now := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)
+	hash := strings.Repeat("a", 64)
+	uuid := "11111111-2222-3333-4444-555555555555"
+	contentsDir, _ := contentsEntry(t, root, hash, uuid, "module(name=\"x\")", now.Add(-72*time.Hour))
+	// Add a bulky file inside the contents dir to make marker vs.
+	// tree sizes obviously distinct.
+	payload := make([]byte, 128*1024)
+	if err := os.WriteFile(filepath.Join(contentsDir, "blob"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, dryRun := range []bool{false, true} {
+		t.Run(map[bool]string{false: "real", true: "dry"}[dryRun], func(t *testing.T) {
+			// Fresh copy per subtest since the real sweep deletes.
+			testRoot := t.TempDir()
+			testDir, _ := contentsEntry(t, testRoot, hash, uuid, "module()", now.Add(-72*time.Hour))
+			if err := os.WriteFile(filepath.Join(testDir, "blob"), payload, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			stats, err := SweepRepoContentsCache(context.Background(), testRoot, Options{
+				MaxAge: 24 * time.Hour,
+				DryRun: dryRun,
+				Now:    func() time.Time { return now },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stats.Removed != 1 {
+				t.Fatalf("stats=%+v, want Removed=1", stats)
+			}
+			if stats.Bytes < int64(len(payload)) {
+				t.Fatalf("stats.Bytes=%d, want >= %d (payload size)", stats.Bytes, len(payload))
+			}
+		})
+	}
+}
+
 func TestSweepRepoContentsCache_DryRun(t *testing.T) {
 	root := t.TempDir()
 	now := time.Date(2026, 7, 7, 12, 0, 0, 0, time.UTC)

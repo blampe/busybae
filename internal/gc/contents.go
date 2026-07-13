@@ -168,7 +168,9 @@ func sweepRepoContentsHashDir(ctx context.Context, hashDir, trashDir string, cut
 
 		if opts.DryRun {
 			stats.Removed++
-			stats.Bytes += info.Size()
+			// We hold the exclusive gc_lock, so the contents dir is
+			// stable under us for the duration of the walk.
+			stats.Bytes += dirTreeSize(contentsPath)
 			log.Info("would evict repo contents entry",
 				slog.String("marker", markerPath),
 				slog.String("contents", contentsPath),
@@ -198,9 +200,9 @@ func sweepRepoContentsHashDir(ctx context.Context, hashDir, trashDir string, cut
 		if err := os.Rename(contentsPath, dst); err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				// Marker had no paired contents dir. Fine — the
-				// eviction is already effective.
+				// eviction is already effective, and there's
+				// nothing to size.
 				stats.Removed++
-				stats.Bytes += info.Size()
 				continue
 			}
 			stats.Errors++
@@ -208,9 +210,35 @@ func sweepRepoContentsHashDir(ctx context.Context, hashDir, trashDir string, cut
 			continue
 		}
 		stats.Removed++
-		stats.Bytes += info.Size()
+		// Size the tree post-rename: the dir is now isolated in
+		// `_trash/` with no live workspace symlink pointing at it, so
+		// the walk can't race with a concurrent Bazel process even
+		// once we drop the gc_lock.
+		stats.Bytes += dirTreeSize(dst)
 	}
 	return nil
+}
+
+// dirTreeSize sums the byte sizes of every regular file under root.
+// Symlinks and errors are silently skipped — this is best-effort
+// reporting, not accounting.
+func dirTreeSize(root string) int64 {
+	var total int64
+	_ = filepath.WalkDir(root, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		total += info.Size()
+		return nil
+	})
+	return total
 }
 
 // repoContentsCacheLooksPlausible reports whether the given entries look
