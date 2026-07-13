@@ -9,7 +9,9 @@ a configurable age. It's designed to be invoked on every `bazel` command via a
 running one will be started, otherwise it will no-op. The daemon exits after a
 configurable idle period.
 
-Cache directories are discovered by parsing the workspace's `.bazelrc`.
+Cache directories are discovered by parsing the workspace's `.bazelrc`. The
+daemon is keyed on the resolved cache-dir set, so multiple git worktrees of
+the same repo share a single daemon while unrelated workspaces get their own.
 
 ## Usage
 

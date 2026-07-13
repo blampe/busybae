@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"busybae/internal/bazelrc"
 	"busybae/internal/gc"
 )
 
@@ -64,6 +65,35 @@ func TestPrintSweepSummaryEmpty(t *testing.T) {
 	printSweepSummary(&buf, nil, false)
 	if buf.Len() != 0 {
 		t.Fatalf("empty results should produce no output, got %q", buf.String())
+	}
+}
+
+func TestDaemonKey(t *testing.T) {
+	// Two worktrees of the same repo pointing at the same cache dirs
+	// should hash to the same key so they share a daemon.
+	a := bazelrc.CacheDirs{
+		RepositoryCache:   "/home/u/.cache/bazel/repo",
+		DiskCache:         "/home/u/.cache/bazel/disk",
+		RepoContentsCache: "/home/u/.cache/bazel/repo/contents",
+		OutputUserRoot:    "/home/u/.cache/bazel/_bazel_u",
+	}
+	if got, want := daemonKey(a, "/src/wt-a"), daemonKey(a, "/src/wt-b"); got != want {
+		t.Errorf("same cache dirs must share a key: %q vs %q", got, want)
+	}
+
+	// Different cache dirs must produce different keys.
+	b := a
+	b.DiskCache = "/home/u/.cache/bazel/other-disk"
+	if daemonKey(a, "/src/wt-a") == daemonKey(b, "/src/wt-a") {
+		t.Errorf("distinct disk_cache should produce distinct keys")
+	}
+
+	// Empty cache dirs must fall back to the workspace path so two
+	// unrelated workspaces without a discoverable .bazelrc don't
+	// collide on the same daemon.
+	empty := bazelrc.CacheDirs{}
+	if daemonKey(empty, "/src/x") == daemonKey(empty, "/src/y") {
+		t.Errorf("empty cache dirs must key on workspace path")
 	}
 }
 

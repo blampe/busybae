@@ -27,6 +27,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 
@@ -207,8 +208,8 @@ Common flags (see 'busybae daemon -h' for the full list):
 }
 
 // resolveSocket computes the socket path from --socket or, when unset, from
-// the workspace path.
-func resolveSocket(explicit, workspace string) (string, error) {
+// the daemon key.
+func resolveSocket(explicit, key string) (string, error) {
 	if explicit != "" {
 		return explicit, nil
 	}
@@ -218,9 +219,27 @@ func resolveSocket(explicit, workspace string) (string, error) {
 			tmp = xdg
 		}
 	}
-	h := sha256.Sum256([]byte(workspace))
-	name := "busybae-" + hex.EncodeToString(h[:4]) + ".sock"
-	return filepath.Join(tmp, name), nil
+	return filepath.Join(tmp, "busybae-"+key+".sock"), nil
+}
+
+// daemonKey produces a short fingerprint identifying the daemon that should
+// serve a given cache-dir set. Workspaces that resolve to the same cache
+// paths (e.g. two git worktrees whose .bazelrc points at the same absolute
+// `disk_cache`) share a daemon; workspaces with distinct paths get their
+// own. Falls back to the workspace path when no cache dirs were discovered.
+func daemonKey(c bazelrc.CacheDirs, workspace string) string {
+	parts := []string{
+		c.RepositoryCache,
+		c.DiskCache,
+		c.RepoContentsCache,
+		c.OutputUserRoot,
+	}
+	src := strings.Join(parts, "\x00")
+	if strings.Trim(src, "\x00") == "" {
+		src = workspace
+	}
+	h := sha256.Sum256([]byte(src))
+	return hex.EncodeToString(h[:4])
 }
 
 // resolveWorkspace returns explicit if set, otherwise walks up from cwd
@@ -375,7 +394,10 @@ func cmdPoke(args []string) int {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
-	sock, err := resolveSocket(g.socket, ws)
+	// Discovery failure is non-fatal: daemonKey falls back to the
+	// workspace path so we still route to *some* daemon.
+	cache, _ := discoverDirs(ws)
+	sock, err := resolveSocket(g.socket, daemonKey(cache, ws))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -517,7 +539,7 @@ func cmdDaemon(args []string) int {
 		return 0
 	}
 
-	sock, err := resolveSocket(g.socket, ws)
+	sock, err := resolveSocket(g.socket, daemonKey(cache, ws))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
@@ -767,5 +789,9 @@ func cmdDirs(args []string) int {
 	}
 	fmt.Printf("output_user_root:   %s %s\n", cache.OutputUserRoot, outputNote)
 	fmt.Printf("swept targets:      %d\n", len(targets))
+	sock, err := resolveSocket(g.socket, daemonKey(cache, ws))
+	if err == nil {
+		fmt.Printf("daemon socket:      %s\n", sock)
+	}
 	return 0
 }
